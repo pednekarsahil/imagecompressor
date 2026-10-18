@@ -773,8 +773,8 @@ HTML_PAGE = r"""
     </section>
 
     <footer class="foot">
-      <span>FastAPI · Pillow · Vanilla JS</span>
-      <span>© 2026</span>
+      
+      <span>© 2026 Sahil Pednekar</span>
     </footer>
   </main>
 
@@ -980,6 +980,8 @@ HTML_PAGE = r"""
 # ══════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     import uvicorn
-    print("\n🚀 Image Compressor 2026")
+    print("\n Image Compressor Running Successfully")
+    print("\n Click OR Copy Below Link To Start Using Our Service")
+    print("\n You Can Also Copy The Below Link And Paste It On Normal Browser")
     print("   → http://127.0.0.1:8000\n")
     uvicorn.run(app, host="127.0.0.1", port=8000)
