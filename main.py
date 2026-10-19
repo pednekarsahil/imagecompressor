@@ -11,6 +11,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
+from pdf2docx import Converter  # ← NEW
 
 # ══════════════════════════════════════════════════════════════
 #  PRESETS & CORE COMPRESSION (identical to your Tkinter version)
@@ -157,6 +158,42 @@ def compress_bytes(input_bytes, filename, quality=None, preset=None,
 
 
 # ══════════════════════════════════════════════════════════════
+#  PDF → WORD CONVERTER  (NEW)
+# ══════════════════════════════════════════════════════════════
+def pdf_to_word_bytes(input_bytes, filename):
+    """Convert a PDF byte-stream into a .docx byte-stream using pdf2docx."""
+    # pdf2docx needs real file paths, so use temporary files
+    tmp_in = os.path.join(OUTPUT_DIR, f"_{uuid.uuid4().hex}.pdf")
+    tmp_out = os.path.join(OUTPUT_DIR, f"_{uuid.uuid4().hex}.docx")
+
+    try:
+        with open(tmp_in, "wb") as f:
+            f.write(input_bytes)
+
+        cv = Converter(tmp_in)
+        cv.convert(tmp_out)
+        cv.close()
+
+        with open(tmp_out, "rb") as f:
+            docx_bytes = f.read()
+
+        base = os.path.splitext(filename)[0]
+        out_name = f"{base}.docx"
+
+        return docx_bytes, out_name, {
+            "original_kb": len(input_bytes) / 1024,
+            "output_kb": len(docx_bytes) / 1024,
+        }
+    finally:
+        for p in (tmp_in, tmp_out):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+
+
+# ══════════════════════════════════════════════════════════════
 #  FASTAPI
 # ══════════════════════════════════════════════════════════════
 app = FastAPI(title="Image Compressor 2026")
@@ -193,6 +230,33 @@ async def api_compress(
         )
     except Exception as e:
         raise HTTPException(500, f"Compression failed: {e}")
+
+    save_name = f"{uuid.uuid4().hex[:8]}_{out_name}"
+    save_path = os.path.join(OUTPUT_DIR, save_name)
+    with open(save_path, "wb") as f:
+        f.write(out_bytes)
+
+    return JSONResponse({
+        "ok": True,
+        "filename": out_name,
+        "download_url": f"/output/{save_name}",
+        "stats": stats,
+    })
+
+
+# ══════════════════════════════════════════════════════════════
+#  NEW ENDPOINT — PDF → WORD
+# ══════════════════════════════════════════════════════════════
+@app.post("/api/pdf-to-word")
+async def api_pdf_to_word(file: UploadFile = File(...)):
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext != ".pdf":
+        raise HTTPException(400, f"Only .pdf files are supported (got {ext})")
+    try:
+        data = await file.read()
+        out_bytes, out_name, stats = pdf_to_word_bytes(data, file.filename)
+    except Exception as e:
+        raise HTTPException(500, f"PDF→Word conversion failed: {e}")
 
     save_name = f"{uuid.uuid4().hex[:8]}_{out_name}"
     save_path = os.path.join(OUTPUT_DIR, save_name)
@@ -267,7 +331,7 @@ HTML_PAGE = r"""
     display: flex; justify-content: space-between; align-items: center;
     padding: 16px 32px;
     backdrop-filter: blur(22px) saturate(140%);
-    background: rgba(7, 9, 15, 0.65);
+    
     border-bottom: 1px solid var(--panel-border);
   }
   .brand { display: flex; align-items: center; gap: 12px; font-weight: 700; font-size: 17px; letter-spacing: -0.3px; }
@@ -276,7 +340,7 @@ HTML_PAGE = r"""
     background: linear-gradient(135deg, var(--accent), var(--accent-2));
     display: grid; place-items: center;
     font-size: 18px; font-weight: 900;
-    box-shadow: 0 6px 22px -6px var(--accent);
+    
   }
   .brand strong {
     background: linear-gradient(90deg, var(--accent-2), var(--accent));
@@ -474,7 +538,7 @@ HTML_PAGE = r"""
     width: 22px; height: 22px; border-radius: 50%;
     background: linear-gradient(135deg, var(--accent-2), var(--accent));
     cursor: pointer;
-    box-shadow: 0 2px 12px rgba(109, 94, 252, 0.6), 0 0 0 4px rgba(109, 94, 252, 0.12);
+    
     transition: transform .15s;
   }
   input[type="range"]::-webkit-slider-thumb:hover { transform: scale(1.12); }
@@ -601,6 +665,28 @@ HTML_PAGE = r"""
     font-size: 13px; margin-bottom: 8px;
   }
 
+  /* Tabs (NEW) */
+  .tabs {
+    display: flex; gap: 8px; margin-bottom: 26px;
+    background: rgba(20, 28, 46, 0.4);
+    padding: 6px; border-radius: 14px;
+    border: 1px solid var(--panel-border);
+  }
+  .tab {
+    flex: 1; padding: 14px 18px; border-radius: 10px;
+    background: transparent; border: none;
+    color: var(--text-dim); font: inherit; font-weight: 600;
+    font-size: 14px; cursor: pointer; transition: all .2s;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active {
+    background: linear-gradient(135deg, var(--accent), #8b7fff);
+    color: white;
+    box-shadow: 0 6px 20px -8px var(--accent);
+  }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; animation: fadeUp .35s ease; }
+
   /* Footer */
   .foot {
     display: flex; justify-content: space-between;
@@ -636,144 +722,192 @@ HTML_PAGE = r"""
 
   <nav class="nav">
     <div class="brand">
-      
       <span>Compressor<strong>.ai</strong></span>
     </div>
-    <div class="nav-links">
-      
-    </div>
+    <div class="nav-links"></div>
   </nav>
 
   <main class="container">
     <section class="hero">
-     
       <h1>Compress to <span class="grad">any size</span><br>you want.</h1>
       <p class="sub">Drop images, type a target in KB or MB, and let the binary-search engine find the highest quality that still fits.</p>
     </section>
 
-    <!-- Dropzone -->
-    <div id="dropzone" class="dropzone">
-      <input type="file" id="fileInput" multiple accept=".jpg,.jpeg,.png,.webp,.bmp,.tif,.tiff" hidden />
-      <div class="dz-icon">⬆</div>
-      <h3>Drop images here</h3>
-      <p>or <button type="button" id="browseBtn" class="link-btn">browse files</button></p>
-      <small>JPG · PNG · WEBP · BMP · TIFF — any size</small>
+    <!-- ═══════ NEW: TABS ═══════ -->
+    <div class="tabs">
+      <button class="tab active" data-tab="compress">Image Compress</button>
+      <button class="tab" data-tab="pdfword">PDF → Word</button>
     </div>
 
-    <!-- Files panel -->
-    <div id="filesPanel" class="files-panel">
-      <div class="files-header">
-        <h3 id="filesCount">0 files</h3>
-        <button id="clearBtn" class="clear-btn">Clear all</button>
-      </div>
-      <div id="fileList" class="file-list"></div>
-    </div>
+    <!-- ═══════════ TAB 1: IMAGE COMPRESSOR (unchanged) ═══════════ -->
+    <div class="tab-panel active" id="tab-compress">
 
-    <!-- Settings -->
-    <section class="panel">
-      <div class="panel-header">
-        <h2>Compression Settings</h2>
+      <!-- Dropzone -->
+      <div id="dropzone" class="dropzone">
+        <input type="file" id="fileInput" multiple accept=".jpg,.jpeg,.png,.webp,.bmp,.tif,.tiff" hidden />
+        <div class="dz-icon">⬆</div>
+        <h3>Drop images here</h3>
+        <p>or <button type="button" id="browseBtn" class="link-btn">browse files</button></p>
+        <small>JPG · PNG · WEBP · BMP · TIFF — any size</small>
       </div>
 
-      <!-- ⭐ TARGET SIZE -->
-      <div class="setting target">
-        <div class="setting-info">
-          <label> Target file size</label>
-          <p class="hint">Leave blank to compress using preset/quality only</p>
+      <!-- Files panel -->
+      <div id="filesPanel" class="files-panel">
+        <div class="files-header">
+          <h3 id="filesCount">0 files</h3>
+          <button id="clearBtn" class="clear-btn">Clear all</button>
         </div>
-        <div class="input-group">
-          <input type="number" id="targetSize" placeholder="e.g. 200" min="1" step="1" />
-          <select id="targetUnit">
-            <option value="KB" selected>KB</option>
-            <option value="MB">MB</option>
-          </select>
-        </div>
+        <div id="fileList" class="file-list"></div>
       </div>
 
-      <!-- Preset -->
-      <div class="setting">
-        <div class="setting-info">
-          <label>Quality preset</label>
-          <p class="hint">Click to auto-configure settings</p>
+      <!-- Settings -->
+      <section class="panel">
+        <div class="panel-header">
+          <h2>Compression Settings</h2>
         </div>
-        <div id="presetChips" class="chip-row">
-          <button class="chip" data-preset="lossless">Lossless</button>
-          <button class="chip" data-preset="high">High</button>
-          <button class="chip active" data-preset="balanced">Balanced</button>
-          <button class="chip" data-preset="web">Web</button>
-          <button class="chip" data-preset="thumbnail">Thumbnail</button>
-          <button class="chip" data-preset="aggressive">Aggressive</button>
-        </div>
-      </div>
 
-      <!-- Quality -->
-      <div class="setting">
-        <div class="setting-info">
-          <label>Quality <span id="qualityVal" class="value-badge">78</span></label>
-          <p class="hint">Lower = smaller file · higher = sharper</p>
-        </div>
-        <div class="slider-wrap">
-          <input type="range" id="quality" min="1" max="100" value="78" />
-        </div>
-      </div>
-
-      <!-- Grid -->
-      <div class="grid-2">
-        <div class="setting compact">
+        <div class="setting target">
           <div class="setting-info">
-            <label>Max dimension</label>
-            <p class="hint">Blank = keep original</p>
+            <label> Target file size</label>
+            <p class="hint">Leave blank to compress using preset/quality only</p>
           </div>
           <div class="input-group">
-            <input type="number" id="maxDim" placeholder="1920" min="16" />
-            <span class="unit">px</span>
+            <input type="number" id="targetSize" placeholder="e.g. 200" min="1" step="1" />
+            <select id="targetUnit">
+              <option value="KB" selected>KB</option>
+              <option value="MB">MB</option>
+            </select>
           </div>
         </div>
-        <div class="setting compact">
+
+        <div class="setting">
           <div class="setting-info">
-            <label>Output format</label>
-            <p class="hint">WebP saves ~30% more</p>
+            <label>Quality preset</label>
+            <p class="hint">Click to auto-configure settings</p>
           </div>
-          <select id="format">
-            <option value="">Keep original</option>
-            <option value="JPEG">JPEG</option>
-            <option value="PNG">PNG</option>
-            <option value="WEBP">WEBP</option>
-            <option value="BMP">BMP</option>
-            <option value="TIFF">TIFF</option>
-          </select>
+          <div id="presetChips" class="chip-row">
+            <button class="chip" data-preset="lossless">Lossless</button>
+            <button class="chip" data-preset="high">High</button>
+            <button class="chip active" data-preset="balanced">Balanced</button>
+            <button class="chip" data-preset="web">Web</button>
+            <button class="chip" data-preset="thumbnail">Thumbnail</button>
+            <button class="chip" data-preset="aggressive">Aggressive</button>
+          </div>
         </div>
+
+        <div class="setting">
+          <div class="setting-info">
+            <label>Quality <span id="qualityVal" class="value-badge">78</span></label>
+            <p class="hint">Lower = smaller file · higher = sharper</p>
+          </div>
+          <div class="slider-wrap">
+            <input type="range" id="quality" min="1" max="100" value="78" />
+          </div>
+        </div>
+
+        <div class="grid-2">
+          <div class="setting compact">
+            <div class="setting-info">
+              <label>Max dimension</label>
+              <p class="hint">Blank = keep original</p>
+            </div>
+            <div class="input-group">
+              <input type="number" id="maxDim" placeholder="1920" min="16" />
+              <span class="unit">px</span>
+            </div>
+          </div>
+          <div class="setting compact">
+            <div class="setting-info">
+              <label>Output format</label>
+              <p class="hint">WebP saves ~30% more</p>
+            </div>
+            <select id="format">
+              <option value="">Keep original</option>
+              <option value="JPEG">JPEG</option>
+              <option value="PNG">PNG</option>
+              <option value="WEBP">WEBP</option>
+              <option value="BMP">BMP</option>
+              <option value="TIFF">TIFF</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="setting">
+          <div class="setting-info">
+            <label>Preserve EXIF metadata</label>
+            <p class="hint">Camera info, GPS, date</p>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="keepExif" checked />
+            <span class="slider-knob"></span>
+          </label>
+        </div>
+      </section>
+
+      <button id="compressBtn" class="btn-primary" disabled>Compress Now</button>
+
+      <section id="results" class="results">
+        <div class="panel" style="margin-top:26px">
+          <div class="panel-header">
+            <h2>✅ Results</h2>
+            <div id="totalSaved" class="pill-sm success">—</div>
+          </div>
+          <div id="resultList"></div>
+        </div>
+      </section>
+    </div>
+
+    <!-- ═══════════ TAB 2: PDF → WORD (NEW) ═══════════ -->
+    <div class="tab-panel" id="tab-pdfword">
+
+      <!-- Dropzone -->
+      <div id="pdfDropzone" class="dropzone">
+        <input type="file" id="pdfFileInput" accept=".pdf,application/pdf" hidden />
+        <div class="dz-icon">⬆</div>
+        <h3>Drop a PDF file here</h3>
+        <p>or <button type="button" id="pdfBrowseBtn" class="link-btn">browse files</button></p>
+        <small>PDF only · best for text-based PDFs · scanned PDFs may need OCR first</small>
       </div>
 
-      <!-- EXIF -->
-      <div class="setting">
-        <div class="setting-info">
-          <label>Preserve EXIF metadata</label>
-          <p class="hint">Camera info, GPS, date</p>
+      <!-- File panel -->
+      <div id="pdfFilePanel" class="files-panel">
+        <div class="files-header">
+          <h3 id="pdfFileCount">0 files</h3>
+          <button id="pdfClearBtn" class="clear-btn">Clear</button>
         </div>
-        <label class="switch">
-          <input type="checkbox" id="keepExif" checked />
-          <span class="slider-knob"></span>
-        </label>
+        <div id="pdfFileList" class="file-list"></div>
       </div>
-    </section>
 
-    <!-- Compress -->
-    <button id="compressBtn" class="btn-primary" disabled>Compress Now</button>
-
-    <!-- Results -->
-    <section id="results" class="results">
-      <div class="panel" style="margin-top:26px">
+      <!-- Info panel -->
+      <section class="panel">
         <div class="panel-header">
-          <h2>✅ Results</h2>
-          <div id="totalSaved" class="pill-sm success">—</div>
+          <h2>PDF → Word Settings</h2>
         </div>
-        <div id="resultList"></div>
-      </div>
-    </section>
+        <div class="setting">
+          <div class="setting-info">
+            <label>How it works</label>
+            <p class="hint">
+              Uses <b>pdf2docx</b> to convert PDF pages into an editable <b>.docx</b> file.
+              Text, tables, and images are preserved as much as possible.
+              Best results on text-based PDFs — scanned images should be OCR'd first.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <button id="pdfConvertBtn" class="btn-primary" disabled>Convert PDF → Word</button>
+
+      <section id="pdfResults" class="results">
+        <div class="panel" style="margin-top:26px">
+          <div class="panel-header">
+            <h2>✅ Results</h2>
+          </div>
+          <div id="pdfResultList"></div>
+        </div>
+      </section>
+    </div>
 
     <footer class="foot">
-      
       <span>© 2026 Sahil Pednekar</span>
     </footer>
   </main>
@@ -781,6 +915,25 @@ HTML_PAGE = r"""
 <script>
 (() => {
   const $ = (s) => document.querySelector(s);
+
+  // ═══════ TAB SWITCHING (NEW) ═══════
+  const tabs = document.querySelectorAll('.tab');
+  const panels = {
+    compress: $('#tab-compress'),
+    pdfword:  $('#tab-pdfword'),
+  };
+  tabs.forEach(t => {
+    t.addEventListener('click', () => {
+      tabs.forEach(x => x.classList.remove('active'));
+      t.classList.add('active');
+      Object.values(panels).forEach(p => p.classList.remove('active'));
+      panels[t.dataset.tab].classList.add('active');
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  //  TAB 1: IMAGE COMPRESSOR (original logic — unchanged)
+  // ═══════════════════════════════════════════════════════════
   const files = [];
   const PRESETS = {
     lossless:   { quality: 100, maxDimension: null },
@@ -812,7 +965,6 @@ HTML_PAGE = r"""
   const presetChips = document.querySelectorAll('.chip');
   let activePreset = 'balanced';
 
-  // ── File handling
   const fmtSize = (b) => {
     if (b < 1024) return b + ' B';
     if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB';
@@ -822,7 +974,7 @@ HTML_PAGE = r"""
   const renderFiles = () => {
     filesCount.textContent = `${files.length} file${files.length === 1 ? '' : 's'}`;
     filesPanel.classList.toggle('active', files.length > 0);
-    fileListEl.innerHTML = files.map((f, i) => `
+    fileListEl.innerHTML = files.map((f) => `
       <div class="file-item">
         <span class="file-name">${f.name}</span>
         <span class="file-size">${fmtSize(f.size)}</span>
@@ -868,7 +1020,6 @@ HTML_PAGE = r"""
     resultsEl.classList.remove('active');
   });
 
-  // ── Preset chips
   presetChips.forEach(chip => {
     chip.addEventListener('click', () => {
       presetChips.forEach(c => c.classList.remove('active'));
@@ -887,7 +1038,6 @@ HTML_PAGE = r"""
     qualityVal.textContent = e.target.value;
   });
 
-  // ── Compress
   compressBtn.addEventListener('click', async () => {
     if (files.length === 0) return;
 
@@ -927,7 +1077,6 @@ HTML_PAGE = r"""
       } catch (err) {
         allResults.push({ ok: false, error: err.message, file: f });
       }
-      // render progressively
       renderResults(allResults);
     }
 
@@ -966,8 +1115,120 @@ HTML_PAGE = r"""
     }).join('');
   }
 
-  // seed UI
   qualityVal.textContent = qualityEl.value;
+
+  // ═══════════════════════════════════════════════════════════
+  //  TAB 2: PDF → WORD (NEW)
+  // ═══════════════════════════════════════════════════════════
+  const pdfFiles = [];
+  const pdfDropzone = $('#pdfDropzone');
+  const pdfFileInput = $('#pdfFileInput');
+  const pdfBrowseBtn = $('#pdfBrowseBtn');
+  const pdfFilePanel = $('#pdfFilePanel');
+  const pdfFileList = $('#pdfFileList');
+  const pdfFileCount = $('#pdfFileCount');
+  const pdfClearBtn = $('#pdfClearBtn');
+  const pdfConvertBtn = $('#pdfConvertBtn');
+  const pdfResultsEl = $('#pdfResults');
+  const pdfResultListEl = $('#pdfResultList');
+
+  const renderPdfFiles = () => {
+    pdfFileCount.textContent = `${pdfFiles.length} file${pdfFiles.length === 1 ? '' : 's'}`;
+    pdfFilePanel.classList.toggle('active', pdfFiles.length > 0);
+    pdfFileList.innerHTML = pdfFiles.map((f) => `
+      <div class="file-item">
+        <span class="file-name">${f.name}</span>
+        <span class="file-size">${fmtSize(f.size)}</span>
+      </div>
+    `).join('');
+    pdfConvertBtn.disabled = pdfFiles.length === 0;
+  };
+
+  const addPdfFiles = (list) => {
+    for (const f of list) {
+      if (/\.pdf$/i.test(f.name)) pdfFiles.push(f);
+    }
+    renderPdfFiles();
+  };
+
+  pdfDropzone.addEventListener('click', (e) => {
+    if (e.target === pdfBrowseBtn) return;
+    pdfFileInput.click();
+  });
+  pdfBrowseBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    pdfFileInput.click();
+  });
+  pdfFileInput.addEventListener('change', (e) => {
+    addPdfFiles(e.target.files);
+    pdfFileInput.value = '';
+  });
+
+  ['dragenter', 'dragover'].forEach(ev =>
+    pdfDropzone.addEventListener(ev, (e) => {
+      e.preventDefault(); pdfDropzone.classList.add('drag');
+    })
+  );
+  ['dragleave', 'drop'].forEach(ev =>
+    pdfDropzone.addEventListener(ev, (e) => {
+      e.preventDefault(); pdfDropzone.classList.remove('drag');
+    })
+  );
+  pdfDropzone.addEventListener('drop', (e) => addPdfFiles(e.dataTransfer.files));
+
+  pdfClearBtn.addEventListener('click', () => {
+    pdfFiles.length = 0; renderPdfFiles();
+    pdfResultsEl.classList.remove('active');
+  });
+
+  pdfConvertBtn.addEventListener('click', async () => {
+    if (pdfFiles.length === 0) return;
+
+    pdfConvertBtn.disabled = true;
+    pdfConvertBtn.innerHTML = '<span class="spinner"></span>Converting…';
+    pdfResultsEl.classList.remove('active');
+    pdfResultListEl.innerHTML = '';
+
+    const allResults = [];
+    for (const f of pdfFiles) {
+      const form = new FormData();
+      form.append('file', f);
+      try {
+        const res = await fetch('/api/pdf-to-word', { method: 'POST', body: form });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'Server error');
+        allResults.push({ ok: true, data, file: f });
+      } catch (err) {
+        allResults.push({ ok: false, error: err.message, file: f });
+      }
+      renderPdfResults(allResults);
+    }
+
+    pdfResultsEl.classList.add('active');
+    pdfConvertBtn.disabled = false;
+    pdfConvertBtn.textContent = '🔄 Convert PDF → Word';
+  });
+
+  function renderPdfResults(results) {
+    pdfResultListEl.innerHTML = results.map(r => {
+      if (!r.ok) {
+        return `<div class="error-item">✗ ${r.file.name} — ${r.error}</div>`;
+      }
+      const s = r.data.stats;
+      return `
+        <div class="result-item">
+          <div class="result-head">
+            <span class="result-name">${r.data.filename}</span>
+            <span class="result-badge">DOCX</span>
+          </div>
+          <div class="result-stats">
+            <span>${s.original_kb.toFixed(1)} KB PDF → ${s.output_kb.toFixed(1)} KB DOCX</span>
+            <a class="dl-btn" href="${r.data.download_url}" download>⬇ Download</a>
+          </div>
+        </div>
+      `;
+    }).join('');
+  }
 })();
 </script>
 </body>
