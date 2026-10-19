@@ -7,11 +7,14 @@ Open: http://127.0.0.1:8000
 import os
 import io
 import uuid
+import shutil
+import subprocess
+import tempfile
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
-from pdf2docx import Converter  # ← NEW
+from pdf2docx import Converter
 
 # ══════════════════════════════════════════════════════════════
 #  PRESETS & CORE COMPRESSION (identical to your Tkinter version)
@@ -37,13 +40,9 @@ def _prepare_image(img, max_dimension=None, keep_exif=True, auto_orient=True):
     exif_bytes = b""
     if keep_exif and "exif" in img.info:
         exif_bytes = img.info["exif"]
-    if img.mode in ("RGBA", "LA", "P"):
-        bg = Image.new("RGB", img.size, (255, 255, 255))
-        conv = img.convert("RGBA") if img.mode == "P" else img
-        bg.paste(conv, mask=conv.split()[-1])
-        img = bg
-    elif img.mode not in ("RGB", "L"):
-        img = img.convert("RGB")
+    # NOTE: Do NOT flatten RGBA/LA/P onto a white background here —
+    # that was silently changing colours. We keep the image's own
+    # palette / alpha and let the format-specific save step decide.
     if max_dimension:
         w, h = img.size
         longest = max(w, h)
@@ -51,6 +50,47 @@ def _prepare_image(img, max_dimension=None, keep_exif=True, auto_orient=True):
             r = max_dimension / longest
             img = img.resize((max(1, int(w * r)), max(1, int(h * r))), Image.LANCZOS)
     return img, exif_bytes
+
+
+def _reduce_pixel_quality(img, quality):
+    """
+    Reduce 'pixel quality' by quantising the palette (colour depth),
+    NOT by flattening transparency or shifting hues.
+    """
+    if quality >= 95:
+        return img
+
+    if quality <= 0:
+        return img
+    palette_size = max(8, min(256, int(8 + (quality / 94.0) * 248)))
+
+    if img.mode in ("RGBA", "LA", "P"):
+        try:
+            if img.mode == "P":
+                img = img.convert("RGBA")
+            q = img.convert("RGBA").quantize(
+                colors=palette_size, method=Image.FASTOCTREE
+            )
+            return q
+        except Exception:
+            return img
+
+    if img.mode in ("RGB", "L"):
+        try:
+            return img.quantize(
+                colors=palette_size,
+                method=Image.MEDIANCUT,
+                dither=Image.FLOYDSTEINBERG if quality >= 40 else Image.NONE,
+            )
+        except Exception:
+            return img
+
+    try:
+        return img.convert("RGB").quantize(
+            colors=palette_size, method=Image.MEDIANCUT
+        )
+    except Exception:
+        return img
 
 
 def _save_kwargs(fmt, quality, subsampling, optimize, progressive, exif_bytes):
@@ -78,9 +118,29 @@ def _fmt_from_name(name):
 
 
 def _encode(img, fmt, kw):
+    save_img = img
+    if fmt in ("JPEG", "BMP") and save_img.mode not in ("RGB", "L"):
+        try:
+            rgba = save_img.convert("RGBA")
+            bg_color = (255, 255, 255)
+            small = rgba.resize((32, 32))
+            counts = {}
+            for px in small.getdata():
+                if px[3] >= 128:
+                    counts[px[:3]] = counts.get(px[:3], 0) + 1
+            if counts:
+                bg_color = max(counts.items(), key=lambda kv: kv[1])[0]
+            bg = Image.new("RGB", rgba.size, bg_color)
+            bg.paste(rgba, mask=rgba.split()[-1])
+            save_img = bg
+        except Exception:
+            save_img = save_img.convert("RGB")
+    elif fmt not in ("PNG", "WEBP", "TIFF") and save_img.mode == "P":
+        save_img = save_img.convert("RGB")
+
     buf = io.BytesIO()
-    img.save(buf, format=fmt, **kw)
-    return buf.getvalue()
+    save_img.save(buf, format=fmt, **kw)
+    return buf.getvalue(), save_img
 
 
 def compress_bytes(input_bytes, filename, quality=None, preset=None,
@@ -99,11 +159,15 @@ def compress_bytes(input_bytes, filename, quality=None, preset=None,
     img = Image.open(io.BytesIO(input_bytes))
     orig_w, orig_h = img.size
     img, exif_bytes = _prepare_image(img, max_dimension, keep_exif)
+
+    img = _reduce_pixel_quality(img, quality)
+
     save_kw = _save_kwargs(fmt, quality, subsampling, optimize, True, exif_bytes)
 
     if max_size_kb:
         target = max_size_kb * 1024
         best_bytes, best_q = None, 1
+        best_img = img
         low, high = 5, 95
         for _ in range(12):
             q = (low + high) // 2
@@ -112,12 +176,13 @@ def compress_bytes(input_bytes, filename, quality=None, preset=None,
                 trial["quality"] = q
             elif fmt == "PNG":
                 trial["compress_level"] = max(0, min(9, int((100 - q) / 11)))
+            trial_img = _reduce_pixel_quality(img, q)
             try:
-                data = _encode(img, fmt, trial)
+                data, saved_img = _encode(trial_img, fmt, trial)
             except Exception:
                 break
             if len(data) <= target:
-                best_bytes, best_q = data, q
+                best_bytes, best_q, best_img = data, q, saved_img
                 low = q + 1
             else:
                 high = q - 1
@@ -128,19 +193,21 @@ def compress_bytes(input_bytes, filename, quality=None, preset=None,
             while scale > 0.15:
                 new = (max(1, int(img.width * scale)), max(1, int(img.height * scale)))
                 timg = img.resize(new, Image.LANCZOS)
+                timg = _reduce_pixel_quality(timg, 40)
                 trial = dict(save_kw)
                 if fmt in ("JPEG", "WEBP"):
                     trial["quality"] = 40
-                data = _encode(timg, fmt, trial)
+                data, saved_img = _encode(timg, fmt, trial)
                 if len(data) <= target:
-                    best_bytes, img = data, timg
+                    best_bytes, best_img = data, saved_img
                     break
                 scale -= 0.1
         if best_bytes is None:
             raise RuntimeError("Could not reach target size.")
         out_bytes = best_bytes
+        img = best_img
     else:
-        out_bytes = _encode(img, fmt, save_kw)
+        out_bytes, img = _encode(img, fmt, save_kw)
 
     ext_map = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp",
                "BMP": ".bmp", "TIFF": ".tiff"}
@@ -158,11 +225,46 @@ def compress_bytes(input_bytes, filename, quality=None, preset=None,
 
 
 # ══════════════════════════════════════════════════════════════
-#  PDF → WORD CONVERTER  (NEW)
+#  PDF → WORD CONVERTER
+#  Now supports TWO engines:
+#    • "pdf2docx"    → pure-python library (default, works everywhere)
+#    • "libreoffice" → uses the system's `soffice` binary (better flow)
 # ══════════════════════════════════════════════════════════════
-def pdf_to_word_bytes(input_bytes, filename):
-    """Convert a PDF byte-stream into a .docx byte-stream using pdf2docx."""
-    # pdf2docx needs real file paths, so use temporary files
+def _find_soffice():
+    """Locate the LibreOffice `soffice` binary across platforms."""
+    # 1. Try PATH first
+    for name in ("soffice", "soffice.exe", "libreoffice"):
+        p = shutil.which(name)
+        if p:
+            return p
+    # 2. Try common install locations
+    candidates = [
+        r"C:\Program Files\LibreOffice\program\soffice.exe",
+        r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+        "/usr/bin/soffice",
+        "/usr/local/bin/soffice",
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return None
+
+
+def pdf_to_word_bytes(input_bytes, filename, engine="pdf2docx"):
+    """Convert a PDF byte-stream into a .docx byte-stream.
+
+    engine = "pdf2docx"    → original behaviour (unchanged)
+    engine = "libreoffice" → shell out to LibreOffice headless converter
+    """
+    if engine == "libreoffice":
+        return _pdf_to_word_libreoffice(input_bytes, filename)
+    # Default: existing pdf2docx path (unchanged)
+    return _pdf_to_word_pdf2docx(input_bytes, filename)
+
+
+def _pdf_to_word_pdf2docx(input_bytes, filename):
+    """Original converter — untouched logic."""
     tmp_in = os.path.join(OUTPUT_DIR, f"_{uuid.uuid4().hex}.pdf")
     tmp_out = os.path.join(OUTPUT_DIR, f"_{uuid.uuid4().hex}.docx")
 
@@ -183,6 +285,7 @@ def pdf_to_word_bytes(input_bytes, filename):
         return docx_bytes, out_name, {
             "original_kb": len(input_bytes) / 1024,
             "output_kb": len(docx_bytes) / 1024,
+            "engine": "pdf2docx",
         }
     finally:
         for p in (tmp_in, tmp_out):
@@ -191,6 +294,76 @@ def pdf_to_word_bytes(input_bytes, filename):
                     os.remove(p)
             except Exception:
                 pass
+
+
+def _pdf_to_word_libreoffice(input_bytes, filename):
+    """Convert using LibreOffice in headless mode via subprocess."""
+    soffice = _find_soffice()
+    if not soffice:
+        raise RuntimeError(
+            "LibreOffice (soffice) not found on this system. "
+            "Install LibreOffice or pick the 'pdf2docx' engine instead."
+        )
+
+    # Work in an isolated temp dir so LibreOffice's profile/user dir
+    # doesn't clash with a running LibreOffice GUI instance.
+    work_dir = tempfile.mkdtemp(prefix="lo_conv_", dir=OUTPUT_DIR)
+    try:
+        base = os.path.splitext(os.path.basename(filename))[0] or "output"
+        safe_base = "".join(c for c in base if c.isalnum() or c in "._- ") or "output"
+        in_path = os.path.join(work_dir, f"{safe_base}.pdf")
+        out_path = os.path.join(work_dir, f"{safe_base}.docx")
+
+        with open(in_path, "wb") as f:
+            f.write(input_bytes)
+
+        # Use a private user profile so concurrent conversions don't lock up
+        profile_dir = os.path.join(work_dir, "lo_profile")
+        os.makedirs(profile_dir, exist_ok=True)
+        profile_uri = "file:///" + profile_dir.replace("\\", "/").lstrip("/")
+
+        cmd = [
+            soffice,
+            f"-env:UserInstallation={profile_uri}",
+            "--headless",
+            "--norestore",
+            "--nologo",
+            "--nodefault",
+            "--infilter=writer_pdf_import",
+            "--convert-to", "docx:MS Word 2007 XML",
+            "--outdir", work_dir,
+            in_path,
+        ]
+
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=180,
+        )
+
+        if not os.path.exists(out_path):
+            err = (proc.stderr or b"").decode("utf-8", "ignore").strip()
+            out = (proc.stdout or b"").decode("utf-8", "ignore").strip()
+            raise RuntimeError(
+                "LibreOffice conversion produced no output. "
+                f"stdout: {out or '-'} | stderr: {err or '-'}"
+            )
+
+        with open(out_path, "rb") as f:
+            docx_bytes = f.read()
+
+        out_name = f"{base}.docx"
+        return docx_bytes, out_name, {
+            "original_kb": len(input_bytes) / 1024,
+            "output_kb": len(docx_bytes) / 1024,
+            "engine": "libreoffice",
+        }
+    finally:
+        try:
+            shutil.rmtree(work_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 # ══════════════════════════════════════════════════════════════
@@ -245,16 +418,26 @@ async def api_compress(
 
 
 # ══════════════════════════════════════════════════════════════
-#  NEW ENDPOINT — PDF → WORD
+#  PDF → WORD ENDPOINT (now accepts `engine`)
 # ══════════════════════════════════════════════════════════════
 @app.post("/api/pdf-to-word")
-async def api_pdf_to_word(file: UploadFile = File(...)):
+async def api_pdf_to_word(
+    file: UploadFile = File(...),
+    engine: str = Form("pdf2docx"),
+):
     ext = os.path.splitext(file.filename)[1].lower()
     if ext != ".pdf":
         raise HTTPException(400, f"Only .pdf files are supported (got {ext})")
+
+    engine = (engine or "pdf2docx").strip().lower()
+    if engine not in ("pdf2docx", "libreoffice"):
+        raise HTTPException(400, f"Unknown engine: {engine}")
+
     try:
         data = await file.read()
-        out_bytes, out_name, stats = pdf_to_word_bytes(data, file.filename)
+        out_bytes, out_name, stats = pdf_to_word_bytes(
+            data, file.filename, engine=engine
+        )
     except Exception as e:
         raise HTTPException(500, f"PDF→Word conversion failed: {e}")
 
@@ -303,35 +486,100 @@ HTML_PAGE = r"""
   html, body { height: 100%; }
   body {
     font-family: 'Inter', system-ui, sans-serif;
-    background: var(--bg);
+    background:
+      radial-gradient(circle at 20% 20%, #1b1f46 0%, transparent 45%),
+      radial-gradient(circle at 80% 30%, #0f2b46 0%, transparent 45%),
+      radial-gradient(circle at 50% 80%, #2a1740 0%, transparent 45%),
+      linear-gradient(135deg,
+        #07090f 0%,
+        #0b0f22 20%,
+        #10142e 40%,
+        #0d1220 60%,
+        #0a0e1c 80%,
+        #07090f 100%);
+    background-size: 100% 100%, 100% 100%, 100% 100%, 400% 400%;
+    background-attachment: fixed;
+    animation: bgShift 26s ease-in-out infinite;
     color: var(--text);
     min-height: 100vh;
     overflow-x: hidden;
     -webkit-font-smoothing: antialiased;
   }
+  @keyframes bgShift {
+    0%   { background-position: 0% 0%,   100% 0%,  50% 100%, 0% 50%; }
+    50%  { background-position: 60% 40%, 40% 60%, 60% 30%,  100% 50%; }
+    100% { background-position: 0% 0%,   100% 0%,  50% 100%, 0% 50%; }
+  }
 
-  /* Ambient orbs */
-  .orbs { position: fixed; inset: 0; z-index: 0; overflow: hidden; pointer-events: none; }
+  .orbs {
+    position: fixed; inset: 0; z-index: 0;
+    overflow: hidden; pointer-events: none;
+    animation: hueCycle 32s linear infinite;
+  }
   .orb {
     position: absolute; border-radius: 50%;
-    filter: blur(120px); opacity: 0.32;
-    animation: drift 22s ease-in-out infinite alternate;
+    filter: blur(120px); opacity: 0.34;
+    will-change: transform;
   }
-  .orb.a { width: 560px; height: 560px; background: var(--accent);   top: -200px; left: -160px; }
-  .orb.b { width: 460px; height: 460px; background: var(--accent-2); bottom: -180px; right: -140px; animation-delay: -8s; }
-  .orb.c { width: 420px; height: 420px; background: var(--accent-3); top: 45%; left: 45%; animation-delay: -14s; opacity: 0.22; }
-  @keyframes drift {
-    from { transform: translate(0, 0) scale(1); }
-    to   { transform: translate(70px, -50px) scale(1.18); }
+  .orb.a {
+    width: 620px; height: 620px; background: var(--accent);
+    top: -220px; left: -180px;
+    animation: driftA 24s ease-in-out infinite alternate;
+  }
+  .orb.b {
+    width: 520px; height: 520px; background: var(--accent-2);
+    bottom: -220px; right: -160px;
+    animation: driftB 28s ease-in-out infinite alternate;
+  }
+  .orb.c {
+    width: 480px; height: 480px; background: var(--accent-3);
+    top: 40%; left: 40%; opacity: 0.24;
+    animation: driftC 22s ease-in-out infinite alternate;
+  }
+  .orb.d {
+    width: 400px; height: 400px; background: #8b7fff;
+    top: 15%; right: 10%; opacity: 0.22;
+    animation: driftD 30s ease-in-out infinite alternate;
   }
 
-  /* Nav */
+  @keyframes driftA {
+    0%   { transform: translate(0, 0)         scale(1)   rotate(0deg); }
+    50%  { transform: translate(120px, 90px)  scale(1.15) rotate(15deg); }
+    100% { transform: translate(-40px, 140px) scale(1.05) rotate(-8deg); }
+  }
+  @keyframes driftB {
+    0%   { transform: translate(0, 0)          scale(1)    rotate(0deg); }
+    50%  { transform: translate(-140px, -80px) scale(1.12) rotate(-20deg); }
+    100% { transform: translate(60px, -140px)  scale(1.08) rotate(10deg); }
+  }
+  @keyframes driftC {
+    0%   { transform: translate(0, 0)         scale(1)   rotate(0deg); }
+    50%  { transform: translate(-90px, 60px)  scale(1.2) rotate(30deg); }
+    100% { transform: translate(100px, -50px) scale(1.1) rotate(-15deg); }
+  }
+  @keyframes driftD {
+    0%   { transform: translate(0, 0)           scale(1)   rotate(0deg); }
+    50%  { transform: translate(80px, 120px)    scale(1.18) rotate(-25deg); }
+    100% { transform: translate(-100px, 40px)   scale(1.06) rotate(18deg); }
+  }
+  @keyframes hueCycle {
+    0%   { filter: hue-rotate(0deg); }
+    50%  { filter: hue-rotate(35deg); }
+    100% { filter: hue-rotate(0deg); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    body, .orbs, .orb.a, .orb.b, .orb.c, .orb.d {
+      animation: none !important;
+    }
+  }
+
   .nav {
     position: sticky; top: 0; z-index: 10;
     display: flex; justify-content: space-between; align-items: center;
     padding: 16px 32px;
     backdrop-filter: blur(22px) saturate(140%);
-    
+    background: rgba(7, 9, 15, 0.35);
     border-bottom: 1px solid var(--panel-border);
   }
   .brand { display: flex; align-items: center; gap: 12px; font-weight: 700; font-size: 17px; letter-spacing: -0.3px; }
@@ -340,7 +588,6 @@ HTML_PAGE = r"""
     background: linear-gradient(135deg, var(--accent), var(--accent-2));
     display: grid; place-items: center;
     font-size: 18px; font-weight: 900;
-    
   }
   .brand strong {
     background: linear-gradient(90deg, var(--accent-2), var(--accent));
@@ -349,29 +596,14 @@ HTML_PAGE = r"""
   .nav-links { display: flex; align-items: center; gap: 22px; font-size: 14px; color: var(--text-dim); }
   .nav-links a { color: var(--text-dim); text-decoration: none; transition: color .2s; }
   .nav-links a:hover { color: var(--text); }
-  .pill {
-    font-size: 11px; font-weight: 600; padding: 5px 10px;
-    border-radius: 999px; background: rgba(109, 94, 252, 0.14);
-    color: #b3aaff; border: 1px solid rgba(109, 94, 252, 0.3);
-    font-family: 'JetBrains Mono', monospace;
-  }
 
-  /* Container */
   .container {
     position: relative; z-index: 1;
     max-width: 980px; margin: 0 auto;
     padding: 60px 24px 80px;
   }
 
-  /* Hero */
   .hero { text-align: center; margin-bottom: 48px; }
-  .hero-badge {
-    display: inline-block; font-size: 13px; font-weight: 500;
-    padding: 7px 14px; border-radius: 999px;
-    background: rgba(34, 211, 238, 0.08);
-    border: 1px solid rgba(34, 211, 238, 0.22);
-    color: #7de8f5; margin-bottom: 24px;
-  }
   h1 {
     font-size: clamp(32px, 5vw, 54px); line-height: 1.05;
     font-weight: 800; letter-spacing: -1.5px; margin-bottom: 18px;
@@ -382,7 +614,6 @@ HTML_PAGE = r"""
   }
   .sub { font-size: 17px; color: var(--text-dim); max-width: 640px; margin: 0 auto; line-height: 1.55; }
 
-  /* Dropzone */
   .dropzone {
     border: 2px dashed rgba(120, 140, 200, 0.25);
     border-radius: var(--radius);
@@ -395,7 +626,6 @@ HTML_PAGE = r"""
   .dropzone:hover, .dropzone.drag {
     border-color: var(--accent);
     background: rgba(109, 94, 252, 0.08);
-    box-shadow: 0 0 0 6px rgba(109, 94, 252, 0.08);
   }
   .dz-icon {
     font-size: 42px; margin-bottom: 12px;
@@ -411,7 +641,6 @@ HTML_PAGE = r"""
     text-underline-offset: 3px;
   }
 
-  /* File list */
   .files-panel {
     background: var(--panel);
     border: 1px solid var(--panel-border);
@@ -427,12 +656,32 @@ HTML_PAGE = r"""
   }
   .files-header h3 { font-size: 14px; font-weight: 600; color: var(--text-dim); text-transform: uppercase; letter-spacing: 1px; }
   .clear-btn {
-    background: rgba(239, 68, 68, 0.1); color: #fca5a5;
-    border: 1px solid rgba(239, 68, 68, 0.25);
-    padding: 6px 12px; border-radius: 8px;
-    font-size: 12px; font-weight: 600; cursor: pointer; transition: all .2s;
+    background: linear-gradient(180deg, #ef5350 0%, #d32f2f 100%);
+    color: #fff;
+    border: 1px solid #b71c1c;
+    border-top: 1px solid #ff8a80;
+    padding: 7px 14px; border-radius: 9px;
+    font-size: 12px; font-weight: 700; cursor: pointer;
+    letter-spacing: .3px;
+    text-shadow: 0 -1px 0 rgba(0,0,0,.25);
+    box-shadow:
+      0 1px 0 rgba(255,255,255,.25) inset,
+      0 -2px 0 rgba(0,0,0,.15) inset,
+      0 3px 0 #7f1010,
+      0 6px 12px rgba(0,0,0,.45);
+    transition: transform .12s ease, box-shadow .12s ease, background .2s;
   }
-  .clear-btn:hover { background: rgba(239, 68, 68, 0.2); }
+  .clear-btn:hover {
+    background: linear-gradient(180deg, #f0605a 0%, #e53e3e 100%);
+  }
+  .clear-btn:active {
+    transform: translateY(3px);
+    box-shadow:
+      0 1px 0 rgba(255,255,255,.2) inset,
+      0 -1px 0 rgba(0,0,0,.1) inset,
+      0 0 0 #7f1010,
+      0 2px 6px rgba(0,0,0,.4);
+  }
   .file-list { display: flex; flex-direction: column; gap: 6px; max-height: 220px; overflow-y: auto; }
   .file-item {
     display: flex; justify-content: space-between; align-items: center;
@@ -443,7 +692,6 @@ HTML_PAGE = r"""
   .file-name { color: var(--text); font-family: 'JetBrains Mono', monospace; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
   .file-size { color: var(--text-dim); font-size: 12px; margin-left: 12px; font-variant-numeric: tabular-nums; }
 
-  /* Panel */
   .panel {
     background: var(--panel);
     border: 1px solid var(--panel-border);
@@ -464,7 +712,6 @@ HTML_PAGE = r"""
   }
   .pill-sm.success { background: rgba(34, 197, 94, 0.1); color: #86efac; border-color: rgba(34, 197, 94, 0.3); }
 
-  /* Setting rows */
   .setting {
     display: grid;
     grid-template-columns: 1fr auto;
@@ -477,9 +724,7 @@ HTML_PAGE = r"""
     display: block; font-size: 14px; font-weight: 600; margin-bottom: 3px;
   }
   .hint { font-size: 12px; color: var(--text-dim); line-height: 1.4; }
-  .star { color: #fbbf24; margin-right: 4px; }
 
-  /* Target size highlight */
   .setting.target {
     background: linear-gradient(135deg, rgba(109, 94, 252, 0.09), rgba(34, 211, 238, 0.05));
     border: 1px solid rgba(109, 94, 252, 0.28);
@@ -488,7 +733,6 @@ HTML_PAGE = r"""
   }
   .setting.target label { font-size: 15px; font-weight: 700; }
 
-  /* Inputs */
   input[type="number"], select {
     background: rgba(13, 18, 32, 0.7);
     border: 1px solid rgba(120, 140, 200, 0.18);
@@ -508,24 +752,59 @@ HTML_PAGE = r"""
   .input-group { display: flex; gap: 8px; align-items: center; }
   .input-group .unit { color: var(--text-dim); font-size: 13px; }
 
-  /* Chips */
-  .chip-row { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; max-width: 420px; }
+  .chip-row { display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-end; max-width: 420px; }
   .chip {
-    background: rgba(13, 18, 32, 0.7);
-    border: 1px solid rgba(120, 140, 200, 0.18);
-    color: var(--text-dim);
-    padding: 8px 14px; border-radius: 999px;
-    font-size: 13px; font-weight: 500; cursor: pointer;
-    transition: all .2s;
+    position: relative;
+    background: linear-gradient(180deg, #2a3355 0%, #1a2140 100%);
+    color: #c7d0ec;
+    padding: 9px 16px; border-radius: 999px;
+    border: 1px solid rgba(120, 140, 200, 0.28);
+    font-size: 13px; font-weight: 600; cursor: pointer;
+    letter-spacing: .2px;
+    text-shadow: 0 1px 0 rgba(0,0,0,.35);
+    box-shadow:
+      0 1px 0 rgba(255,255,255,.10) inset,
+      0 -2px 0 rgba(0,0,0,.25) inset,
+      0 3px 0 #0d1220,
+      0 6px 14px rgba(0,0,0,.45);
+    transition: transform .12s ease, box-shadow .12s ease, background .2s, color .2s;
   }
-  .chip:hover { border-color: var(--accent); color: var(--text); }
+  .chip:hover {
+    color: #fff;
+    background: linear-gradient(180deg, #354070 0%, #202a55 100%);
+    border-color: rgba(140, 160, 230, 0.45);
+  }
+  .chip:active {
+    transform: translateY(3px);
+    box-shadow:
+      0 1px 0 rgba(255,255,255,.08) inset,
+      0 -1px 0 rgba(0,0,0,.2) inset,
+      0 0 0 #0d1220,
+      0 2px 6px rgba(0,0,0,.4);
+  }
   .chip.active {
-    background: linear-gradient(135deg, var(--accent), #8b7fff);
-    border-color: transparent; color: white;
-    box-shadow: 0 6px 20px -8px var(--accent);
+    background: linear-gradient(180deg, #8b7fff 0%, #6d5efc 55%, #5646e0 100%);
+    color: #fff;
+    border-color: #a99bff;
+    text-shadow: 0 1px 0 rgba(0,0,0,.3);
+    box-shadow:
+      0 1px 0 rgba(255,255,255,.35) inset,
+      0 -2px 0 rgba(0,0,0,.22) inset,
+      0 3px 0 #3a2fbf,
+      0 4px 10px rgba(0,0,0,.4);
+  }
+  .chip.active:hover {
+    background: linear-gradient(180deg, #9a8fff 0%, #7a6bff 55%, #6050ec 100%);
+  }
+  .chip.active:active {
+    transform: translateY(3px);
+    box-shadow:
+      0 1px 0 rgba(255,255,255,.25) inset,
+      0 -1px 0 rgba(0,0,0,.15) inset,
+      0 0 0 #3a2fbf,
+      0 2px 6px rgba(0,0,0,.4);
   }
 
-  /* Slider */
   .slider-wrap { position: relative; width: 320px; }
   input[type="range"] {
     -webkit-appearance: none; appearance: none;
@@ -538,7 +817,6 @@ HTML_PAGE = r"""
     width: 22px; height: 22px; border-radius: 50%;
     background: linear-gradient(135deg, var(--accent-2), var(--accent));
     cursor: pointer;
-    
     transition: transform .15s;
   }
   input[type="range"]::-webkit-slider-thumb:hover { transform: scale(1.12); }
@@ -554,11 +832,9 @@ HTML_PAGE = r"""
     color: #b3aaff; margin-left: 8px; font-weight: 600;
   }
 
-  /* Grid */
   .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
   .grid-2 .setting { grid-template-columns: 1fr auto; border-bottom: none; }
 
-  /* Toggle switch */
   .toggle { display: flex; align-items: center; gap: 14px; }
   .switch { position: relative; display: inline-block; width: 46px; height: 26px; }
   .switch input { opacity: 0; width: 0; height: 0; }
@@ -580,27 +856,97 @@ HTML_PAGE = r"""
     transform: translateX(20px);
   }
 
-  /* Primary button */
   .btn-primary {
+    position: relative;
     width: 100%;
-    padding: 20px;
-    border: none; border-radius: var(--radius);
-    background: linear-gradient(135deg, var(--accent), #8b7fff 55%, var(--accent-2));
-    color: white;
-    font: inherit; font-size: 17px; font-weight: 700;
-    letter-spacing: 0.2px; cursor: pointer;
-    transition: all .25s;
-    box-shadow: 0 20px 40px -18px var(--accent), 0 6px 16px -6px rgba(34, 211, 238, 0.4);
-    position: relative; overflow: hidden;
+    padding: 20px 24px;
+    border: 1px solid #4a3fd1;
+    border-top: 1px solid #b3aaff;
+    border-bottom: 1px solid #3a2fbf;
+    border-radius: var(--radius);
+    background:
+      linear-gradient(180deg,
+        #9a8fff 0%,
+        #6d5efc 35%,
+        #5646e0 70%,
+        #4737c5 100%);
+    color: #fff;
+    font: inherit; font-size: 17px; font-weight: 800;
+    letter-spacing: 0.4px; cursor: pointer;
+    text-shadow: 0 1px 2px rgba(0,0,0,.45), 0 -1px 0 rgba(0,0,0,.25);
+    box-shadow:
+      0 1px 0 rgba(255,255,255,.4) inset,
+      0 2px 0 rgba(255,255,255,.12) inset,
+      0 -3px 0 rgba(0,0,0,.18) inset,
+      0 -1px 0 rgba(0,0,0,.35) inset,
+      0 6px 0 #3a2fbf,
+      0 7px 0 #2e2499,
+      0 8px 18px rgba(0,0,0,.55);
+    transform: translateY(0);
+    transition:
+      transform .12s cubic-bezier(.2,.7,.3,1),
+      box-shadow .12s cubic-bezier(.2,.7,.3,1),
+      background .2s;
+    overflow: hidden;
+    isolation: isolate;
+  }
+  .btn-primary::before {
+    content: "";
+    position: absolute;
+    top: 0; left: 0; right: 0; height: 50%;
+    background: linear-gradient(180deg, rgba(255,255,255,.22), rgba(255,255,255,0));
+    border-radius: var(--radius) var(--radius) 40% 40% / var(--radius) var(--radius) 100% 100%;
+    pointer-events: none;
+    z-index: -1;
   }
   .btn-primary:hover:not(:disabled) {
-    transform: translateY(-2px);
-    box-shadow: 0 26px 50px -18px var(--accent), 0 10px 22px -8px rgba(34, 211, 238, 0.5);
+    background:
+      linear-gradient(180deg,
+        #aa9fff 0%,
+        #7a6bff 35%,
+        #6050ec 70%,
+        #5142d0 100%);
+    transform: translateY(-1px);
+    box-shadow:
+      0 1px 0 rgba(255,255,255,.45) inset,
+      0 2px 0 rgba(255,255,255,.14) inset,
+      0 -3px 0 rgba(0,0,0,.18) inset,
+      0 -1px 0 rgba(0,0,0,.35) inset,
+      0 7px 0 #3a2fbf,
+      0 8px 0 #2e2499,
+      0 10px 22px rgba(0,0,0,.55);
+  }
+  .btn-primary:active:not(:disabled) {
+    transform: translateY(6px);
+    box-shadow:
+      0 1px 0 rgba(255,255,255,.25) inset,
+      0 -1px 0 rgba(0,0,0,.25) inset,
+      0 0 0 #3a2fbf,
+      0 1px 0 #2e2499,
+      0 3px 8px rgba(0,0,0,.5);
+    background:
+      linear-gradient(180deg,
+        #7f6ff0 0%,
+        #5c4cf0 35%,
+        #4a3ad0 70%,
+        #3e30b8 100%);
   }
   .btn-primary:disabled {
-    opacity: 0.35; cursor: not-allowed;
-    background: rgba(109, 94, 252, 0.3);
-    box-shadow: none;
+    opacity: 0.55; cursor: not-allowed;
+    background:
+      linear-gradient(180deg, #4b4f6e 0%, #3a3e58 55%, #2e3149 100%);
+    border-color: #2a2d40;
+    border-top-color: #565a80;
+    border-bottom-color: #1c1e2c;
+    color: #aeb6d6;
+    text-shadow: 0 1px 0 rgba(0,0,0,.5);
+    box-shadow:
+      0 1px 0 rgba(255,255,255,.1) inset,
+      0 -2px 0 rgba(0,0,0,.25) inset,
+      0 3px 0 #1c1e2c,
+      0 3px 0 #14151f,
+      0 8px 16px rgba(0,0,0,.45);
+    transform: translateY(0);
   }
   .btn-primary .spinner {
     display: inline-block; width: 16px; height: 16px;
@@ -611,7 +957,6 @@ HTML_PAGE = r"""
   }
   @keyframes spin { to { transform: rotate(360deg); } }
 
-  /* Results */
   .results { display: none; }
   .results.active { display: block; animation: fadeUp .5s ease; }
   @keyframes fadeUp {
@@ -647,16 +992,37 @@ HTML_PAGE = r"""
     font-size: 12px; color: var(--text-dim);
     gap: 12px;
   }
+
   .dl-btn {
     display: inline-flex; align-items: center; gap: 6px;
-    padding: 8px 14px; border-radius: 9px;
-    background: rgba(109, 94, 252, 0.14);
-    color: #b3aaff;
-    border: 1px solid rgba(109, 94, 252, 0.28);
-    font-size: 12px; font-weight: 600; text-decoration: none;
-    transition: all .2s;
+    padding: 9px 16px; border-radius: 10px;
+    background: linear-gradient(180deg, #3a3178 0%, #2b2460 55%, #221c4f 100%);
+    color: #d4cdff;
+    border: 1px solid #5449b8;
+    border-top: 1px solid #7f73e0;
+    border-bottom: 1px solid #1a1540;
+    font-size: 12px; font-weight: 700; text-decoration: none;
+    letter-spacing: .3px;
+    text-shadow: 0 1px 0 rgba(0,0,0,.5);
+    box-shadow:
+      0 1px 0 rgba(255,255,255,.15) inset,
+      0 -2px 0 rgba(0,0,0,.25) inset,
+      0 3px 0 #14102e,
+      0 6px 12px rgba(0,0,0,.5);
+    transition: transform .12s ease, box-shadow .12s ease, background .2s, color .2s;
   }
-  .dl-btn:hover { background: rgba(109, 94, 252, 0.25); color: white; }
+  .dl-btn:hover {
+    color: #fff;
+    background: linear-gradient(180deg, #4a3f95 0%, #362d78 55%, #2a2366 100%);
+  }
+  .dl-btn:active {
+    transform: translateY(3px);
+    box-shadow:
+      0 1px 0 rgba(255,255,255,.1) inset,
+      0 -1px 0 rgba(0,0,0,.2) inset,
+      0 0 0 #14102e,
+      0 2px 6px rgba(0,0,0,.45);
+  }
   .error-item {
     background: rgba(239, 68, 68, 0.08);
     border: 1px solid rgba(239, 68, 68, 0.25);
@@ -665,36 +1031,86 @@ HTML_PAGE = r"""
     font-size: 13px; margin-bottom: 8px;
   }
 
-  /* Tabs (NEW) */
   .tabs {
     display: flex; gap: 8px; margin-bottom: 26px;
-    background: rgba(20, 28, 46, 0.4);
-    padding: 6px; border-radius: 14px;
+    background:
+      linear-gradient(180deg, #0a0d18 0%, #0f1426 100%);
+    padding: 8px; border-radius: 16px;
     border: 1px solid var(--panel-border);
+    box-shadow:
+      0 1px 0 rgba(255,255,255,.04) inset,
+      0 -2px 0 rgba(0,0,0,.4) inset,
+      0 8px 20px rgba(0,0,0,.4);
   }
   .tab {
-    flex: 1; padding: 14px 18px; border-radius: 10px;
-    background: transparent; border: none;
-    color: var(--text-dim); font: inherit; font-weight: 600;
-    font-size: 14px; cursor: pointer; transition: all .2s;
+    position: relative;
+    flex: 1; padding: 14px 18px; border-radius: 11px;
+    background: linear-gradient(180deg, #1e2542 0%, #161b34 100%);
+    color: #a4b0d2;
+    border: 1px solid rgba(120, 140, 200, 0.18);
+    font: inherit; font-weight: 700;
+    font-size: 14px; cursor: pointer;
+    letter-spacing: .3px;
+    text-shadow: 0 1px 0 rgba(0,0,0,.4);
+    box-shadow:
+      0 1px 0 rgba(255,255,255,.06) inset,
+      0 -2px 0 rgba(0,0,0,.3) inset,
+      0 3px 0 #080a15,
+      0 5px 10px rgba(0,0,0,.4);
+    transition: transform .12s ease, box-shadow .12s ease, background .2s, color .2s;
   }
-  .tab:hover { color: var(--text); }
+  .tab:hover { color: #fff; }
+  .tab:active {
+    transform: translateY(3px);
+    box-shadow:
+      0 1px 0 rgba(255,255,255,.05) inset,
+      0 -1px 0 rgba(0,0,0,.2) inset,
+      0 0 0 #080a15,
+      0 2px 6px rgba(0,0,0,.4);
+  }
   .tab.active {
-    background: linear-gradient(135deg, var(--accent), #8b7fff);
-    color: white;
-    box-shadow: 0 6px 20px -8px var(--accent);
+    background:
+      linear-gradient(180deg,
+        #9a8fff 0%,
+        #6d5efc 45%,
+        #5646e0 75%,
+        #4737c5 100%);
+    color: #fff;
+    border-color: #a99bff;
+    border-top-color: #c9c0ff;
+    border-bottom-color: #3a2fbf;
+    text-shadow: 0 1px 0 rgba(0,0,0,.35);
+    box-shadow:
+      0 1px 0 rgba(255,255,255,.35) inset,
+      0 -2px 0 rgba(0,0,0,.2) inset,
+      0 3px 0 #3a2fbf,
+      0 4px 10px rgba(0,0,0,.45);
+  }
+  .tab.active:hover {
+    background:
+      linear-gradient(180deg,
+        #aa9fff 0%,
+        #7a6bff 45%,
+        #6050ec 75%,
+        #5142d0 100%);
+  }
+  .tab.active:active {
+    transform: translateY(3px);
+    box-shadow:
+      0 1px 0 rgba(255,255,255,.25) inset,
+      0 -1px 0 rgba(0,0,0,.15) inset,
+      0 0 0 #3a2fbf,
+      0 2px 6px rgba(0,0,0,.4);
   }
   .tab-panel { display: none; }
   .tab-panel.active { display: block; animation: fadeUp .35s ease; }
 
-  /* Footer */
   .foot {
     display: flex; justify-content: space-between;
     font-size: 12px; color: var(--text-dim);
     padding-top: 40px; opacity: 0.6;
   }
 
-  /* Scrollbar */
   ::-webkit-scrollbar { width: 8px; height: 8px; }
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb {
@@ -718,11 +1134,12 @@ HTML_PAGE = r"""
     <div class="orb a"></div>
     <div class="orb b"></div>
     <div class="orb c"></div>
+    <div class="orb d"></div>
   </div>
 
   <nav class="nav">
     <div class="brand">
-      <span>Compressor<strong>.ai</strong></span>
+      <span>Image<strong>.Compressor</strong></span>
     </div>
     <div class="nav-links"></div>
   </nav>
@@ -733,16 +1150,13 @@ HTML_PAGE = r"""
       <p class="sub">Drop images, type a target in KB or MB, and let the binary-search engine find the highest quality that still fits.</p>
     </section>
 
-    <!-- ═══════ NEW: TABS ═══════ -->
     <div class="tabs">
       <button class="tab active" data-tab="compress">Image Compress</button>
       <button class="tab" data-tab="pdfword">PDF → Word</button>
     </div>
 
-    <!-- ═══════════ TAB 1: IMAGE COMPRESSOR (unchanged) ═══════════ -->
     <div class="tab-panel active" id="tab-compress">
 
-      <!-- Dropzone -->
       <div id="dropzone" class="dropzone">
         <input type="file" id="fileInput" multiple accept=".jpg,.jpeg,.png,.webp,.bmp,.tif,.tiff" hidden />
         <div class="dz-icon">⬆</div>
@@ -751,7 +1165,6 @@ HTML_PAGE = r"""
         <small>JPG · PNG · WEBP · BMP · TIFF — any size</small>
       </div>
 
-      <!-- Files panel -->
       <div id="filesPanel" class="files-panel">
         <div class="files-header">
           <h3 id="filesCount">0 files</h3>
@@ -760,7 +1173,6 @@ HTML_PAGE = r"""
         <div id="fileList" class="file-list"></div>
       </div>
 
-      <!-- Settings -->
       <section class="panel">
         <div class="panel-header">
           <h2>Compression Settings</h2>
@@ -857,10 +1269,8 @@ HTML_PAGE = r"""
       </section>
     </div>
 
-    <!-- ═══════════ TAB 2: PDF → WORD (NEW) ═══════════ -->
     <div class="tab-panel" id="tab-pdfword">
 
-      <!-- Dropzone -->
       <div id="pdfDropzone" class="dropzone">
         <input type="file" id="pdfFileInput" accept=".pdf,application/pdf" hidden />
         <div class="dz-icon">⬆</div>
@@ -869,7 +1279,6 @@ HTML_PAGE = r"""
         <small>PDF only · best for text-based PDFs · scanned PDFs may need OCR first</small>
       </div>
 
-      <!-- File panel -->
       <div id="pdfFilePanel" class="files-panel">
         <div class="files-header">
           <h3 id="pdfFileCount">0 files</h3>
@@ -878,21 +1287,22 @@ HTML_PAGE = r"""
         <div id="pdfFileList" class="file-list"></div>
       </div>
 
-      <!-- Info panel -->
+      <!-- ═══════ NEW: CONVERSION ENGINE SELECTOR ═══════ -->
       <section class="panel">
         <div class="panel-header">
-          <h2>PDF → Word Settings</h2>
+          <h2>Conversion Engine</h2>
         </div>
         <div class="setting">
           <div class="setting-info">
-            <label>How it works</label>
-            <p class="hint">
-              Uses <b>pdf2docx</b> to convert PDF pages into an editable <b>.docx</b> file.
-              Text, tables, and images are preserved as much as possible.
-              Best results on text-based PDFs — scanned images should be OCR'd first.
-            </p>
+            <label>PDF → Word engine</label>
+            <p class="hint">Choose which Engine converts the PDF</p>
+          </div>
+          <div id="engineChips" class="chip-row">
+            <button class="chip active" data-engine="pdf2docx">Phoenix</button>
+            <button class="chip" data-engine="libreoffice">Alkazar</button>
           </div>
         </div>
+       
       </section>
 
       <button id="pdfConvertBtn" class="btn-primary" disabled>Convert PDF → Word</button>
@@ -900,7 +1310,7 @@ HTML_PAGE = r"""
       <section id="pdfResults" class="results">
         <div class="panel" style="margin-top:26px">
           <div class="panel-header">
-            <h2>✅ Results</h2>
+            <h2>Results</h2>
           </div>
           <div id="pdfResultList"></div>
         </div>
@@ -916,7 +1326,7 @@ HTML_PAGE = r"""
 (() => {
   const $ = (s) => document.querySelector(s);
 
-  // ═══════ TAB SWITCHING (NEW) ═══════
+  // ═══════ TAB SWITCHING ═══════
   const tabs = document.querySelectorAll('.tab');
   const panels = {
     compress: $('#tab-compress'),
@@ -932,7 +1342,7 @@ HTML_PAGE = r"""
   });
 
   // ═══════════════════════════════════════════════════════════
-  //  TAB 1: IMAGE COMPRESSOR (original logic — unchanged)
+  //  TAB 1: IMAGE COMPRESSOR (unchanged)
   // ═══════════════════════════════════════════════════════════
   const files = [];
   const PRESETS = {
@@ -962,7 +1372,7 @@ HTML_PAGE = r"""
   const resultsEl = $('#results');
   const resultListEl = $('#resultList');
   const totalSaved = $('#totalSaved');
-  const presetChips = document.querySelectorAll('.chip');
+  const presetChips = document.querySelectorAll('#presetChips .chip');
   let activePreset = 'balanced';
 
   const fmtSize = (b) => {
@@ -1091,7 +1501,7 @@ HTML_PAGE = r"""
 
     resultsEl.classList.add('active');
     compressBtn.disabled = false;
-    compressBtn.textContent = '🚀 Compress Now';
+    compressBtn.textContent = 'Compress Now';
   });
 
   function renderResults(results) {
@@ -1118,7 +1528,7 @@ HTML_PAGE = r"""
   qualityVal.textContent = qualityEl.value;
 
   // ═══════════════════════════════════════════════════════════
-  //  TAB 2: PDF → WORD (NEW)
+  //  TAB 2: PDF → WORD
   // ═══════════════════════════════════════════════════════════
   const pdfFiles = [];
   const pdfDropzone = $('#pdfDropzone');
@@ -1131,6 +1541,30 @@ HTML_PAGE = r"""
   const pdfConvertBtn = $('#pdfConvertBtn');
   const pdfResultsEl = $('#pdfResults');
   const pdfResultListEl = $('#pdfResultList');
+
+  // ═══════ NEW: ENGINE SELECTOR STATE ═══════
+  const engineChips = document.querySelectorAll('#engineChips .chip');
+  const engineHint = $('#engineHint');
+  let activeEngine = 'pdf2docx';
+
+  const ENGINE_HINTS = {
+    pdf2docx:
+      '<b>pdf2docx</b> · pure-Python, cross-platform, works out of the box. Best on ' +
+      'simple single-column PDFs with tables.',
+    libreoffice:
+      '<b>LibreOffice</b> · uses the system <code>soffice</code> binary in headless mode. ' +
+      'Usually better at flowing text and multi-column layouts. Requires LibreOffice installed ' +
+      'on the machine running this server.',
+  };
+
+  engineChips.forEach(chip => {
+    chip.addEventListener('click', () => {
+      engineChips.forEach(c => c.classList.remove('active'));
+      chip.classList.add('active');
+      activeEngine = chip.dataset.engine;
+      engineHint.innerHTML = ENGINE_HINTS[activeEngine] || '';
+    });
+  });
 
   const renderPdfFiles = () => {
     pdfFileCount.textContent = `${pdfFiles.length} file${pdfFiles.length === 1 ? '' : 's'}`;
@@ -1185,7 +1619,8 @@ HTML_PAGE = r"""
     if (pdfFiles.length === 0) return;
 
     pdfConvertBtn.disabled = true;
-    pdfConvertBtn.innerHTML = '<span class="spinner"></span>Converting…';
+    pdfConvertBtn.innerHTML =
+      `<span class="spinner"></span>Converting via ${activeEngine === 'libreoffice' ? 'LibreOffice' : 'pdf2docx'}…`;
     pdfResultsEl.classList.remove('active');
     pdfResultListEl.innerHTML = '';
 
@@ -1193,6 +1628,7 @@ HTML_PAGE = r"""
     for (const f of pdfFiles) {
       const form = new FormData();
       form.append('file', f);
+      form.append('engine', activeEngine);  // ═══════ NEW: send chosen engine ═══════
       try {
         const res = await fetch('/api/pdf-to-word', { method: 'POST', body: form });
         const data = await res.json();
@@ -1215,11 +1651,12 @@ HTML_PAGE = r"""
         return `<div class="error-item">✗ ${r.file.name} — ${r.error}</div>`;
       }
       const s = r.data.stats;
+      const engineLabel = (s.engine || activeEngine) === 'libreoffice' ? 'LO' : 'pdf2docx';
       return `
         <div class="result-item">
           <div class="result-head">
             <span class="result-name">${r.data.filename}</span>
-            <span class="result-badge">DOCX</span>
+            <span class="result-badge">DOCX · ${engineLabel}</span>
           </div>
           <div class="result-stats">
             <span>${s.original_kb.toFixed(1)} KB PDF → ${s.output_kb.toFixed(1)} KB DOCX</span>
@@ -1229,6 +1666,8 @@ HTML_PAGE = r"""
       `;
     }).join('');
   }
+
+  engineHint.innerHTML = ENGINE_HINTS[activeEngine];
 })();
 </script>
 </body>
