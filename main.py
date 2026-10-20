@@ -1,28 +1,23 @@
 """
-Image Compressor 2026 — single-file web app (AI via .env only)
+Image Compressor 2026 — single-file web app (Gemini-only AI, google-genai SDK)
 Run:  python app.py
 Open: http://127.0.0.1:8000
 
 Setup:
     1) Create a `.env` file next to app.py (see keys below)
-    2) pip install fastapi uvicorn pillow python-multipart pdf2docx openai python-dotenv
+    2) pip install fastapi uvicorn pillow python-multipart pdf2docx google-genai python-dotenv
     3) python app.py
 
 .env keys:
-    AI_PROVIDER=openai | gemini
-    OPENAI_API_KEY=sk-...
-    OPENAI_VISION_MODEL=gpt-4o-mini
-    OPENAI_OCR_MODEL=gpt-4o
-    GEMINI_API_KEY=AIza...
-    GEMINI_VISION_MODEL=gemini-1.5-flash
-    GEMINI_OCR_MODEL=gemini-1.5-pro
+    GEMINI_API_KEY=AQ.xxxx
+    GEMINI_VISION_MODEL=gemini-3.8-flash
+    GEMINI_OCR_MODEL=gemini-3.8-flash
 """
 
 import os
 import io
 import uuid
 import json
-import base64
 import shutil
 import subprocess
 import tempfile
@@ -39,37 +34,24 @@ try:
 except Exception:
     pass
 
-# ── AI provider detection (OpenAI or Gemini) ───────────────────
-AI_PROVIDER = os.getenv("AI_PROVIDER", "openai").strip().lower()
-OPENAI_KEY  = os.getenv("OPENAI_API_KEY", "").strip()
-GEMINI_KEY  = os.getenv("GEMINI_API_KEY", "").strip()
+# ── AI provider detection (Gemini only, NEW SDK) ────────────────
+GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-_openai_client = None
+_gemini_client = None
 _gemini_model_vision = None
 _gemini_model_ocr = None
 
-if AI_PROVIDER == "openai" and OPENAI_KEY:
+if GEMINI_KEY:
     try:
-        from openai import OpenAI
-        _openai_client = OpenAI(api_key=OPENAI_KEY)
-        print("[AI] OpenAI client ready.")
-    except Exception as e:
-        print(f"[AI] OpenAI init failed: {e}")
-elif AI_PROVIDER == "gemini" and GEMINI_KEY:
-    try:
-        import google.generativeai as genai
-        genai.configure(api_key=GEMINI_KEY)
-        _gemini_model_vision = genai.GenerativeModel(
-            os.getenv("GEMINI_VISION_MODEL", "gemini-1.5-flash")
-        )
-        _gemini_model_ocr = genai.GenerativeModel(
-            os.getenv("GEMINI_OCR_MODEL", "gemini-1.5-pro")
-        )
-        print("[AI] Gemini client ready.")
+        from google import genai
+        _gemini_client = genai.Client(api_key=GEMINI_KEY)
+        _gemini_model_vision = os.getenv("GEMINI_VISION_MODEL", "gemini-3.8-flash")
+        _gemini_model_ocr = os.getenv("GEMINI_OCR_MODEL", "gemini-3.8-flash")
+        print("[AI] Gemini client ready (google-genai SDK).")
     except Exception as e:
         print(f"[AI] Gemini init failed: {e}")
 else:
-    print(f"[AI] No AI provider configured (provider={AI_PROVIDER}). AI features disabled.")
+    print("[AI] No GEMINI_API_KEY set — AI features disabled.")
 
 # ── Optional LPIPS for perceptual quality ──────────────────────
 try:
@@ -85,7 +67,7 @@ except Exception as _e:
 
 
 def _ai_ready():
-    return _openai_client is not None or _gemini_model_vision is not None
+    return _gemini_client is not None
 
 
 # ══════════════════════════════════════════════════════════════
@@ -438,12 +420,12 @@ def _pdf_to_word_libreoffice(input_bytes, filename):
 
 
 # ══════════════════════════════════════════════════════════════
-#  AI: PDF → WORD via vision model (OpenAI or Gemini)
+#  AI: PDF → WORD via Gemini vision (google-genai SDK)
 # ══════════════════════════════════════════════════════════════
 def _pdf_to_word_ai(input_bytes, filename):
     if not _ai_ready():
         raise RuntimeError(
-            "AI OCR engine requires OPENAI_API_KEY or GEMINI_API_KEY in .env. "
+            "AI OCR engine requires GEMINI_API_KEY in .env. "
             "Set it, or use 'pdf2docx' / 'libreoffice' instead."
         )
     try:
@@ -465,26 +447,13 @@ def _pdf_to_word_ai(input_bytes, filename):
 
     for page in doc:
         png_bytes = page.get_pixmap(dpi=150).tobytes("png")
-        if _openai_client is not None:
-            b64 = base64.b64encode(png_bytes).decode()
-            resp = _openai_client.chat.completions.create(
-                model=os.getenv("OPENAI_OCR_MODEL", "gpt-4o"),
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url",
-                         "image_url": {"url": f"data:image/png;base64,{b64}"}}
-                    ]
-                }],
-                max_tokens=4000,
-            )
-            pages_md.append(resp.choices[0].message.content or "")
-        else:
-            from PIL import Image as _PILImage
-            pil_img = _PILImage.open(io.BytesIO(png_bytes))
-            resp = _gemini_model_ocr.generate_content([prompt, pil_img])
-            pages_md.append(getattr(resp, "text", "") or "")
+        from PIL import Image as _PILImage
+        pil_img = _PILImage.open(io.BytesIO(png_bytes))
+        resp = _gemini_client.models.generate_content(
+            model=_gemini_model_ocr,
+            contents=[prompt, pil_img],
+        )
+        pages_md.append(resp.text or "")
 
     out_doc = Document()
     for page_md in pages_md:
@@ -517,11 +486,11 @@ def _pdf_to_word_ai(input_bytes, filename):
 
 
 # ══════════════════════════════════════════════════════════════
-#  AI: image analysis → preset recommendation
+#  AI: image analysis → preset recommendation (Gemini)
 # ══════════════════════════════════════════════════════════════
 def ai_suggest_settings(image_bytes, filename):
     if not _ai_ready():
-        raise RuntimeError("AI is disabled — set OPENAI_API_KEY or GEMINI_API_KEY in .env.")
+        raise RuntimeError("AI is disabled — set GEMINI_API_KEY in .env.")
 
     # Downsize for speed
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -547,37 +516,14 @@ def ai_suggest_settings(image_bytes, filename):
         "thumbnail sized; large photos (>4000px) benefit from max_dimension 1920."
     )
 
-    if _openai_client is not None:
-        b64 = base64.b64encode(jpeg_bytes).decode()
-        resp = _openai_client.chat.completions.create(
-            model=os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini"),
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": [
-                    {"type": "text", "text": user_prompt},
-                    {"type": "image_url",
-                     "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-                ]}
-            ],
-            response_format={"type": "json_object"},
-            max_tokens=150,
-            temperature=0.2,
-        )
-        raw = resp.choices[0].message.content or "{}"
-    else:
-        from PIL import Image as _PILImage
-        pil_img = _PILImage.open(io.BytesIO(jpeg_bytes))
-        resp = _gemini_model_vision.generate_content(
-            [
-                system_prompt + "\n\n" + user_prompt,
-                pil_img,
-            ],
-            generation_config={
-                "temperature": 0.2,
-                "response_mime_type": "application/json",
-            },
-        )
-        raw = getattr(resp, "text", "") or "{}"
+    from PIL import Image as _PILImage
+    pil_img = _PILImage.open(io.BytesIO(jpeg_bytes))
+    resp = _gemini_client.models.generate_content(
+        model=_gemini_model_vision,
+        contents=[system_prompt + "\n\n" + user_prompt, pil_img],
+        config={"temperature": 0.2, "response_mime_type": "application/json"},
+    )
+    raw = resp.text or "{}"
 
     try:
         data = json.loads(raw)
@@ -618,13 +564,8 @@ async def root():
 
 @app.get("/api/ai-status")
 async def api_ai_status():
-    provider = None
-    if _openai_client is not None:
-        provider = "openai"
-    elif _gemini_model_vision is not None:
-        provider = "gemini"
     return {
-        "provider": provider,
+        "provider": "gemini" if _gemini_client is not None else None,
         "vision": _ai_ready(),
         "lpips": _LPIPS_OK,
         "ocr": _ai_ready(),
@@ -714,9 +655,7 @@ async def api_pdf_to_word(
 
 
 # ══════════════════════════════════════════════════════════════
-#  EMBEDDED HTML / CSS / JS
-#  Clay UI, theme picker, AI Suggest chip, AI perceptual toggle,
-#  AI OCR engine chip — all unchanged from the previous version.
+#  EMBEDDED HTML / CSS / JS (unchanged clay UI)
 # ══════════════════════════════════════════════════════════════
 HTML_PAGE = r"""
 <!DOCTYPE html>
@@ -724,7 +663,7 @@ HTML_PAGE = r"""
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Image Compressor · Clay Edition · AI</title>
+<title>Image Compressor</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Quicksand:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
@@ -1185,10 +1124,7 @@ HTML_PAGE = r"""
     background: var(--clay-ai-bg);
     color: var(--clay-ai-text);
     border-color: rgba(255,255,255,0.5);
-    box-shadow: 0 12px 22px -8px var(--clay-ai-glow),
-                inset 0 -3px 6px rgba(255,255,255,0.4),
-                inset 0 3px 8px rgba(255,255,255,0.6);
-    animation: aiPulse 2.5s ease-in-out infinite;
+   
   }
   .chip.ai-chip:hover {
     color: var(--clay-ai-text);
@@ -1415,7 +1351,7 @@ HTML_PAGE = r"""
   <nav class="nav">
     <div class="brand">
       <span>Image<strong>.Compressor</strong></span>
-     
+      
     </div>
     <div class="theme-picker">
       <span class="theme-label">Theme</span>
@@ -1545,7 +1481,6 @@ HTML_PAGE = r"""
         <div class="setting">
           <div class="setting-info">
             <label>AI perceptual quality </label>
-            
           </div>
           <label class="switch">
             <input type="checkbox" id="perceptualToggle" />
@@ -1591,12 +1526,12 @@ HTML_PAGE = r"""
         <div class="setting">
           <div class="setting-info">
             <label>PDF → Word engine</label>
-            <p class="hint">Phoenix (pure Python) · Alkazar (LibreOffice) · AI OCR (vision model, for scans)</p>
+            <p class="hint">Phoenix (pure Python) · Alkazar (LibreOffice) · AI OCR (Gemini vision, for scans)</p>
           </div>
           <div id="engineChips" class="chip-row">
             <button class="chip active" data-engine="pdf2docx">Phoenix</button>
             <button class="chip" data-engine="libreoffice">Alkazar</button>
-            <button class="chip ai-chip" data-engine="ai_ocr" title="Uses vision model — best for scanned PDFs">AI OCR</button>
+            <button class="chip ai-chip" data-engine="ai_ocr" title="Uses Gemini vision — best for scanned PDFs">AI OCR</button>
           </div>
         </div>
       </section>
@@ -1615,7 +1550,7 @@ HTML_PAGE = r"""
 
     <footer class="foot">
       <span>© 2026 Sahil Pednekar</span>
-     
+      
     </footer>
   </main>
 
@@ -1643,12 +1578,12 @@ HTML_PAGE = r"""
     const badge = $('#aiBadge');
     if (AI_VISION) {
       badge.classList.remove('off');
-      badge.textContent = `AI · ${AI_PROVIDER || 'vision'}${AI_LPIPS ? ' + LPIPS' : ''}`;
+      badge.textContent = `AI · ${AI_PROVIDER || 'gemini'}${AI_LPIPS ? ' + LPIPS' : ''}`;
       badge.title = 'AI enabled';
     } else {
       badge.classList.add('off');
       badge.textContent = 'AI off';
-      badge.title = 'Set OPENAI_API_KEY or GEMINI_API_KEY in .env';
+      badge.title = 'Set GEMINI_API_KEY in .env';
     }
     const aiChip = $('#aiSuggestBtn');
     if (!AI_VISION) aiChip.disabled = true;
@@ -1656,12 +1591,11 @@ HTML_PAGE = r"""
     if (!AI_LPIPS) {
       percToggle.disabled = true;
       percToggle.checked = false;
-      $('#perceptualBadge').textContent = 'unavailable';
     }
     const engineChip = document.querySelector('#engineChips .chip[data-engine="ai_ocr"]');
     if (!AI_VISION && engineChip) {
       engineChip.disabled = true;
-      engineChip.title = 'Requires OPENAI_API_KEY or GEMINI_API_KEY in .env';
+      engineChip.title = 'Requires GEMINI_API_KEY in .env';
     }
     $('#aiFoot').textContent = `AI: ${AI_PROVIDER || 'off'} · LPIPS ${AI_LPIPS ? '✓' : '✗'}`;
   }).catch(() => {
@@ -1739,7 +1673,7 @@ HTML_PAGE = r"""
     if (!files.length) { alert('Upload an image first, then click AI Suggest.'); return; }
     const originalText = aiSuggestBtn.textContent;
     aiSuggestBtn.disabled = true;
-    aiSuggestBtn.textContent = '⏳ thinking…';
+    aiSuggestBtn.textContent = 'thinking…';
     try {
       const form = new FormData();
       form.append('file', files[0]);
@@ -1902,7 +1836,7 @@ HTML_PAGE = r"""
     pdfResultsEl.classList.add('active');
     pdfConvertBtn.disabled = false;
     pdfConvertBtn.classList.remove('btn-loading');
-    pdfConvertBtn.textContent = '🔄 Convert PDF → Word';
+    pdfConvertBtn.textContent = 'Convert PDF → Word';
   });
 
   function renderPdfResults(results) {
